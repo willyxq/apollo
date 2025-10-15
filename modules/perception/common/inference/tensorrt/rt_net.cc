@@ -894,7 +894,7 @@ bool RTNet::Init(const std::map<std::string, std::vector<int>> &shapes) {
 
   builder_->setDebugSync(true);
 
-  nvinfer1::ICudaEngine *engine = builder_->buildCudaEngine(*network_);
+  engine_ = builder_->buildCudaEngine(*network_);
 #else
   network_ = builder_->createNetworkV2(0U);
   parse_with_api(shapes);
@@ -910,23 +910,25 @@ bool RTNet::Init(const std::map<std::string, std::vector<int>> &shapes) {
   builder_config_->setInt8Calibrator(calibrator_);
 
   // serialize trt engine the first time
-  nvinfer1::ICudaEngine *engine = nullptr;
+  engine_ = nullptr;
   auto trt_cache_path = model_root_ + "/TRTengine.cache";
   if (!LoadCache(trt_cache_path)) {
-    engine = builder_->buildEngineWithConfig(*network_, *builder_config_);
+    engine_ = builder_->buildEngineWithConfig(*network_, *builder_config_);
 
-    if (engine->serialize()) {
-      nvinfer1::IHostMemory *serialized_model(engine->serialize());
+    if (engine_) {
+      nvinfer1::IHostMemory *serialized_model = engine_->serialize();
+      if (serialized_model != nullptr) {
       std::ofstream f(trt_cache_path, std::ios::binary);
 
       f.write(reinterpret_cast<char *>(serialized_model->data()),
               serialized_model->size());
       serialized_model->destroy();
       AERROR << "Saving serialized model file to " << trt_cache_path;
+      }
     }
   } else {
     AINFO << "Loading TensorRT engine from serialized model file...";
-    std::ifstream planFile(trt_cache_path);
+    std::ifstream planFile(trt_cache_path, std::ios::binary);
 
     if (!planFile.is_open()) {
       AERROR << "Could not open serialized model";
@@ -938,15 +940,18 @@ bool RTNet::Init(const std::map<std::string, std::vector<int>> &shapes) {
     std::stringstream planBuffer;
     planBuffer << planFile.rdbuf();
     std::string plan = planBuffer.str();
-    nvinfer1::IRuntime *runtime = nvinfer1::createInferRuntime(rt_gLogger);
+    runtime_ = nvinfer1::createInferRuntime(rt_gLogger);
 
-    engine = runtime->deserializeCudaEngine(
+    engine_ = runtime_->deserializeCudaEngine(
         static_cast<const void *>(plan.data()), plan.size(), nullptr);
-    runtime->destroy();
   }
 #endif
 #endif
-  context_ = engine->createExecutionContext();
+  if (engine_ == nullptr) {
+    AERROR << "Failed to create TensorRT engine.";
+    return false;
+  }
+  context_ = engine_->createExecutionContext();
   buffers_.resize(input_names_.size() + output_names_.size());
   init_blob(&input_names_);
   init_blob(&output_names_);
@@ -1033,13 +1038,35 @@ RTNet::~RTNet() {
   }
   if (gpu_id_ >= 0) {
     BASE_GPU_CHECK(cudaStreamDestroy(stream_));
-    network_->destroy();
+    // Destroy in safe order: context -> engine -> runtime -> network -> config -> builder
+    if (context_ != nullptr) {
+      context_->destroy();
+      context_ = nullptr;
+    }
+    if (engine_ != nullptr) {
+      engine_->destroy();
+      engine_ = nullptr;
+    }
+    if (runtime_ != nullptr) {
+      runtime_->destroy();
+      runtime_ = nullptr;
+    }
+    if (network_ != nullptr) {
+      network_->destroy();
+      network_ = nullptr;
+    }
 #ifdef NV_TENSORRT_MAJOR
-#if NV_TENSORRT_MAJOR != 8
-    builder_config_->destroy();
+#if NV_TENSORRT_MAJOR == 8
+    if (builder_config_ != nullptr) {
+      builder_config_->destroy();
+      builder_config_ = nullptr;
+    }
 #endif
 #endif
-    context_->destroy();
+    if (builder_ != nullptr) {
+      builder_->destroy();
+      builder_ = nullptr;
+    }
     for (auto buf : buffers_) {
       cudaFree(buf);
     }
