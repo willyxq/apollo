@@ -234,6 +234,9 @@ class RTNet : public Inference {
   nvinfer1::IBuilder *builder_ = nullptr;
   nvinfer1::IBuilderConfig *builder_config_ = nullptr;
   nvinfer1::INetworkDefinition *network_ = nullptr;
+      // Keep engine/runtime alive to satisfy TensorRT lifetime requirements.
+      nvinfer1::ICudaEngine *engine_ = nullptr;
+      nvinfer1::IRuntime *runtime_ = nullptr;  // Only set when deserializing
   std::vector<std::shared_ptr<float>> weights_mem_;
   BlobMap blobs_;
 };
